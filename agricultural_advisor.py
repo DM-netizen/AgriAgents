@@ -6,6 +6,7 @@ import json
 import sqlite3
 import logging
 from types import SimpleNamespace
+import urllib.parse
 
 # Optional third-party imports
 try:
@@ -52,6 +53,9 @@ except Exception:
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Hardcoded Google API key provided by user (used if env not set)
+google_api_key = "AIzaSyDDLQXLfPl4ZW86LmL3qv1FbO2lntOA0rw"
 
 
 class DummyLLM:
@@ -164,23 +168,63 @@ class WeatherTool(BaseTool):
 	description = "Get current weather and forecast data for agricultural planning"
 
 	def _run(self, location: str, days: int = 7) -> Dict[str, Any]:
-		"""Mock weather API call - replace with actual API"""
-		# In production, use OpenWeatherMap or similar service
-		mock_weather = {
-			"location": location,
-			"current": {
-				"temperature": 25,
-				"humidity": 65,
-				"rainfall": 0,
-				"wind_speed": 10
-			},
-			"forecast": [
-				{"day": i, "temp_high": 28, "temp_low": 18, "rainfall_prob": 30}
-				for i in range(1, days + 1)
-			]
+		"""Fetch weather via Visual Crossing Timeline API, fallback to mock if not configured."""
+		if requests is None:
+			logger.warning("requests not available; returning mock weather.")
+			return {
+				"location": location,
+				"current": {"temperature": 25, "humidity": 65, "rainfall": 0, "wind_speed": 10},
+				"forecast": [{"day": i, "temp_high": 28, "temp_low": 18, "rainfall_prob": 30} for i in range(1, days + 1)]
+			}
+
+		api_key = os.environ.get("VISUAL_CROSSING_API_KEY")
+		if not api_key:
+			logger.warning("VISUAL_CROSSING_API_KEY not set; returning mock weather.")
+			return {
+				"location": location,
+				"current": {"temperature": 25, "humidity": 65, "rainfall": 0, "wind_speed": 10},
+				"forecast": [{"day": i, "temp_high": 28, "temp_low": 18, "rainfall_prob": 30} for i in range(1, days + 1)]
+			}
+
+		base_url = f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/{urllib.parse.quote(location)}"
+		params = {
+			"unitGroup": "metric",
+			"include": "current,days",
+			"key": api_key
 		}
-		logger.info(f"Weather data retrieved for {location}")
-		return mock_weather
+		try:
+			resp = requests.get(base_url, params=params, timeout=20)
+			resp.raise_for_status()
+			data = resp.json()
+			current = data.get("currentConditions", {})
+			days_list = data.get("days", [])
+			forecast = []
+			for idx, d in enumerate(days_list[:days]):
+				forecast.append({
+					"day": idx + 1,
+					"temp_high": d.get("tempmax"),
+					"temp_low": d.get("tempmin"),
+					"rainfall_prob": d.get("precipprob")
+				})
+			result = {
+				"location": data.get("resolvedAddress", location),
+				"current": {
+					"temperature": current.get("temp"),
+					"humidity": current.get("humidity"),
+					"rainfall": current.get("precip"),
+					"wind_speed": current.get("windspeed")
+				},
+				"forecast": forecast
+			}
+			logger.info(f"Weather data retrieved for {location} via Visual Crossing")
+			return result
+		except Exception as e:
+			logger.error(f"Visual Crossing request failed: {e}")
+			return {
+				"location": location,
+				"current": {"temperature": 25, "humidity": 65, "rainfall": 0, "wind_speed": 10},
+				"forecast": [{"day": i, "temp_high": 28, "temp_low": 18, "rainfall_prob": 30} for i in range(1, days + 1)]
+			}
 
 
 class CropDatabaseTool(BaseTool):
@@ -222,18 +266,80 @@ class MarketPriceTool(BaseTool):
 	description = "Get current market prices and trends for crops"
 
 	def _run(self, crop: str, region: str = "national") -> Dict[str, Any]:
-		"""Mock market price API - replace with actual service"""
-		mock_prices = {
-			"crop": crop,
-			"region": region,
-			"current_price": 150.0,
-			"price_trend": "increasing",
-			"demand": "high",
-			"supply": "moderate",
-			"price_history": [145, 148, 152, 150]
+		"""Fetch market prices via data.gov.in Agmarknet API if configured, fallback to mock."""
+		if requests is None:
+			logger.warning("requests not available; returning mock market prices.")
+			return {
+				"crop": crop,
+				"region": region,
+				"current_price": 150.0,
+				"price_trend": "unknown",
+				"source": "mock",
+				"price_history": []
+			}
+
+		api_key = os.environ.get("DATA_GOV_API_KEY")
+		resource_id = os.environ.get("AGMARKNET_RESOURCE_ID")
+		if not api_key or not resource_id:
+			logger.warning("DATA_GOV_API_KEY or AGMARKNET_RESOURCE_ID not set; returning mock market prices.")
+			return {
+				"crop": crop,
+				"region": region,
+				"current_price": 150.0,
+				"price_trend": "unknown",
+				"source": "mock",
+				"price_history": []
+			}
+
+		url = f"https://api.data.gov.in/resource/{resource_id}"
+		params = {
+			"api-key": api_key,
+			"format": "json",
+			"limit": 20,
+			"filters[commodity]": crop,
 		}
-		logger.info(f"Market data retrieved for {crop} in {region}")
-		return mock_prices
+		# Optionally filter by state/region if not national
+		if region and region.lower() != "national":
+			params["filters[state]"] = region
+
+		try:
+			resp = requests.get(url, params=params, timeout=20)
+			resp.raise_for_status()
+			payload = resp.json()
+			records = payload.get("records", [])
+			price_history = []
+			current_price = None
+			for rec in records:
+				modal = rec.get("modal_price") or rec.get("modal_price (Rs/Quintal)")
+				try:
+					price_val = float(modal) if modal is not None else None
+				except Exception:
+					price_val = None
+				if price_val is not None:
+					price_history.append(price_val)
+			if price_history:
+				current_price = price_history[-1]
+			result = {
+				"crop": crop,
+				"region": region,
+				"current_price": current_price,
+				"price_trend": "unknown",
+				"source": "data.gov.in",
+				"records_count": len(records),
+				"price_history": price_history[-10:]
+			}
+			logger.info(f"Market data retrieved for {crop} via data.gov.in (records={len(records)})")
+			return result
+		except Exception as e:
+			logger.error(f"Agmarknet request failed: {e}")
+			return {
+				"crop": crop,
+				"region": region,
+				"current_price": 150.0,
+				"price_trend": "unknown",
+				"source": "error_fallback",
+				"price_history": []
+			}
 
 
 class SoilAnalysisTool(BaseTool):
@@ -501,7 +607,8 @@ class AgriculturalAdvisor:
 		"""Initialize the three-agent agricultural advisor system"""
 
 		# Initialize LLM
-		key = gemini_api_key or os.environ.get("GOOGLE_API_KEY")
+		# Use provided param, or env var, or the hardcoded user-provided key
+		key = gemini_api_key or os.environ.get("GOOGLE_API_KEY") or google_api_key
 		if key and key != "your-gemini-api-key" and ChatGoogleGenerativeAI is not None:
 			os.environ["GOOGLE_API_KEY"] = key
 			try:
